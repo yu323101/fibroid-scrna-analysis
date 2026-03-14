@@ -1,0 +1,36 @@
+project:
+  type: default
+  output-dir: docs
+  
+execute:
+  cache: true
+  cache-dir: cache
+  freeze: auto
+  
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-tools: true
+    code-summary: "显示代码"
+    fig-width: 10
+    fig-height: 6
+    fig-format: retina
+    embed-resources: true
+    self-contained: true
+    
+knitr:
+  opts_chunk:
+    collapse: true
+    comment: "#>"
+    message: false
+    warning: false
+    
+# 资源路径
+resources:
+  - data/
+  - results/
+  - figures/

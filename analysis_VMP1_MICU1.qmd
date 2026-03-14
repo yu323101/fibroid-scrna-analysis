@@ -1,0 +1,723 @@
+---
+title: "子宫肌瘤单细胞分析 - VMP1 和 MICU1"
+author: "Your Name"
+date: today
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-tools: true
+    code-summary: "显示代码"
+    fig-width: 10
+    fig-height: 6
+    fig-format: retina
+    embed-resources: true
+execute:
+  cache: true
+  freeze: auto
+knitr:
+  opts_chunk:
+    collapse: true
+    comment: "#>"
+---
+
+# 简介
+
+本分析旨在研究 **VMP1** 和 **MICU1** 基因在子宫肌瘤中的表达模式。
+
+## 分析流程
+
+1. 下载并分析 GSE169255 (RNA-seq) 数据，确定 VMP1 和 MICU1 的差异表达状态
+2. 下载并处理 GSE162122 (scRNA-seq) 数据
+3. 生成图3a: UMAP 聚类图
+4. 生成图3c: 热图（细胞类型特异性表达）
+5. 生成图3d: FeaturePlot（基因表达分布）
+
+# 环境设置
+
+```{r setup}
+#| label: setup
+#| cache: false
+
+# 设置工作目录
+knitr::opts_knit$set(root.dir = normalizePath("."))
+
+# 加载必要的包
+suppressPackageStartupMessages({
+  library(GEOquery)
+  library(DESeq2)
+  library(Seurat)
+  library(ggplot2)
+  library(pheatmap)
+  library(dplyr)
+  library(biomaRt)
+  library(ComplexHeatmap)
+  library(patchwork)
+  library(tidyr)
+  library(readr)
+})
+
+# 创建输出目录
+dirs <- c("data", "results", "figures", "cache")
+for (dir in dirs) {
+  if (!dir.exists(dir)) dir.create(dir, showWarnings = FALSE, recursive = TRUE)
+}
+
+cat("环境设置完成\n")
+cat("工作目录:", getwd(), "\n")
+```
+
+# 阶段1: 下载 GSE169255 (RNA-seq)
+
+```{r download-gse169255}
+#| label: download-gse169255
+#| cache: true
+#| cache.lazy: false
+
+cat("=== 阶段1: 下载 GSE169255 ===\n")
+
+# 检查文件是否已存在
+if (!file.exists("data/GSE169255_sample_id_ReadsperGene.txt")) {
+  cat("正在下载 GSE169255...\n")
+  
+  # 方法1: 使用 GEOquery
+tryCatch({
+    gse169255 <- getGEO("GSE169255", GSEMatrix = TRUE, getGPL = FALSE, 
+                       destdir = "data")
+    # 提取表达矩阵
+    exprs_data <- exprs(gse169255[[1]])
+    write.table(exprs_data, "data/GSE169255_expression_matrix.txt", 
+                sep = "\t", quote = FALSE)
+    cat("✓ GSE169255 下载完成\n")
+  }, error = function(e) {
+    cat("⚠ GEOquery 下载失败，请手动下载:\n")
+    cat("  https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE169255\n")
+    cat("  下载后放到 data/ 目录\n")
+  })
+} else {
+  cat("✓ GSE169255 数据文件已存在\n")
+}
+```
+
+# 阶段2: RNA-seq 差异表达分析
+
+```{r rnaseq-analysis}
+#| label: rnaseq-analysis
+#| cache: true
+#| dependson: download-gse169255
+
+cat("\n=== 阶段2: RNA-seq 差异表达分析 ===\n")
+
+# 读取计数矩阵
+counts_file <- "data/GSE169255_sample_id_ReadsperGene.txt"
+if (!file.exists(counts_file)) {
+  stop("错误: 找不到 GSE169255 数据文件")
+}
+
+gse169255_counts <- read.table(counts_file, header = TRUE, row.names = 1, sep = "\t")
+cat("读取了", nrow(gse169255_counts), "个基因,", ncol(gse169255_counts), "个样本\n")
+
+# 创建样本信息（15个子宫肌层 + 15个子宫肌瘤）
+gse169255_coldata <- data.frame(
+  tissue = factor(c(rep("myometrium", 15), rep("fibroid", 15)),
+                  levels = c("myometrium", "fibroid"))
+)
+row.names(gse169255_coldata) <- colnames(gse169255_counts)
+
+# DESeq2 分析
+cat("运行 DESeq2...\n")
+dds_gse169255 <- DESeqDataSetFromMatrix(
+  countData = gse169255_counts,
+  colData = gse169255_coldata,
+  design = ~ tissue
+)
+
+# 过滤低表达基因
+keep_gse169255 <- rowSums(counts(dds_gse169255)) >= 10
+dds_gse169255 <- dds_gse169255[keep_gse169255,]
+cat("过滤后剩余", nrow(dds_gse169255), "个基因\n")
+
+# 运行 DESeq2
+dds_gse169255 <- DESeq(dds_gse169255, quiet = TRUE)
+
+# 获取结果
+res_gse169255 <- results(dds_gse169255, pAdjustMethod = 'fdr')
+res_gse169255_df <- data.frame(res_gse169255)
+
+# 查看 VMP1 和 MICU1 的结果
+cat("\n=== VMP1 和 MICU1 差异表达结果 ===\n")
+
+genes_of_interest <- c("VMP1", "MICU1")
+results_list <- list()
+
+for (gene in genes_of_interest) {
+  if (gene %in% rownames(res_gse169255_df)) {
+    gene_result <- res_gse169255_df[gene, ]
+    results_list[[gene]] <- gene_result
+    
+    cat("\n", gene, ":\n", sep = "")
+    cat("  log2FoldChange:", round(gene_result$log2FoldChange, 3), "\n")
+    cat("  padj:", format(gene_result$padj, digits = 3, scientific = TRUE), "\n")
+    
+    # 判断调控状态
+    if (is.na(gene_result$padj)) {
+      regulation <- "NA"
+    } else if (gene_result$padj < 0.05 && gene_result$log2FoldChange > 0) {
+      regulation <- "up"
+      cat("  调控: 上调 (up)\n")
+    } else if (gene_result$padj < 0.05 && gene_result$log2FoldChange < 0) {
+      regulation <- "down"
+      cat("  调控: 下调 (down)\n")
+    } else {
+      regulation <- "not_significant"
+      cat("  调控: 不显著\n")
+    }
+    
+    results_list[[gene]]$regulation <- regulation
+  } else {
+    cat("\n警告: 基因", gene, "未在数据中找到\n")
+  }
+}
+
+# 保存结果
+write.csv(res_gse169255_df, "results/GSE169255_DEG_results.csv")
+
+results_summary <- data.frame(
+  Gene = names(results_list),
+  log2FoldChange = sapply(results_list, function(x) x$log2FoldChange),
+  padj = sapply(results_list, function(x) x$padj),
+  Regulation = sapply(results_list, function(x) x$regulation)
+)
+write.csv(results_summary, "results/VMP1_MICU1_regulation_summary.csv", row.names = FALSE)
+
+cat("\n✓ RNA-seq 分析完成，结果已保存\n")
+```
+
+# 阶段3: 检查单细胞数据
+
+```{r check-scrna}
+#| label: check-scrna
+
+cat("\n=== 阶段3: 检查单细胞数据 ===\n")
+
+if (!dir.exists("data/GSE162122_RAW")) {
+  cat("⚠ 警告: GSE162122_RAW 目录不存在\n")
+  cat("\n请手动下载 GSE162122 单细胞数据:\n")
+  cat("  https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE162122\n")
+  cat("\n下载步骤:\n")
+  cat("  1. 点击 'SRA Run Selector' 或下载补充文件\n")
+  cat("  2. 下载所有 10X Genomics 数据文件\n")
+  cat("  3. 解压到 data/GSE162122_RAW/ 目录\n")
+  cat("\n数据应包含以下文件（每个样本）:\n")
+  cat("  - barcodes.tsv.gz\n")
+  cat("  - features.tsv.gz\n")
+  cat("  - matrix.mtx.gz\n")
+  
+  # 创建示例目录结构
+  dir.create("data/GSE162122_RAW", showWarnings = FALSE, recursive = TRUE)
+  cat("\n已创建 data/GSE162122_RAW/ 目录，请放入数据文件\n")
+} else {
+  dirs <- list.dirs(path = "data/GSE162122_RAW", recursive = FALSE)
+  cat("✓ GSE162122_RAW 目录存在\n")
+  cat("  找到", length(dirs), "个样本目录\n")
+  if (length(dirs) > 0) {
+    cat("  样本:", paste(head(dirs, 3), collapse = ", "), "...\n")
+  }
+}
+```
+
+# 阶段4: 单细胞数据处理
+
+```{r scrna-processing}
+#| label: scrna-processing
+#| cache: true
+#| dependson: check-scrna
+#| cache.lazy: false
+
+cat("\n=== 阶段4: 单细胞数据处理 ===\n")
+
+# 检查数据是否存在
+if (!dir.exists("data/GSE162122_RAW") || 
+    length(list.dirs("data/GSE162122_RAW", recursive = FALSE)) == 0) {
+  cat("⚠ 跳过单细胞分析: 数据不存在\n")
+  cat("  请先下载 GSE162122 数据\n")
+  knitr::knit_exit()
+}
+
+# 读取单细胞数据
+dirs <- list.dirs(path = "data/GSE162122_RAW", recursive = FALSE)
+cat("读取", length(dirs), "个样本...\n")
+
+data_list <- lapply(dirs, FUN = function(x){
+  Read10X(x)
+})
+
+names(data_list) <- sapply(dirs, FUN = function(x){
+  sub('.*/', '', x)
+})
+
+cat("✓ 读取完成\n")
+
+# 分离子宫肌瘤和子宫肌层
+seurat_myo_list <- lapply(
+  data_list[grepl(pattern = "Myo|myo", names(data_list))], 
+  FUN = function(x){
+    CreateSeuratObject(counts = x, project = "Myometrium", 
+                       min.cells = 3, min.features = 200)
+  }
+)
+
+seurat_fib_list <- lapply(
+  data_list[grepl(pattern = "Fibroid|fibroid", names(data_list))], 
+  FUN = function(x){
+    CreateSeuratObject(counts = x, project = "Fibroid", 
+                       min.cells = 3, min.features = 200)
+  }
+)
+
+cat("子宫肌层样本数:", length(seurat_myo_list), "\n")
+cat("子宫肌瘤样本数:", length(seurat_fib_list), "\n")
+
+# 添加患者ID
+for (i in seq_along(seurat_myo_list)){
+  seurat_myo_list[[i]][["patient.id"]] <- gsub('_.*', '', names(seurat_myo_list)[i])
+}
+
+for (i in seq_along(seurat_fib_list)){
+  seurat_fib_list[[i]][["patient.id"]] <- gsub('_.*', '', names(seurat_fib_list)[i])
+}
+
+cat("✓ 单细胞数据加载完成\n")
+```
+
+# 阶段5: 质量控制
+
+```{r qc}
+#| label: qc
+#| cache: true
+#| dependson: scrna-processing
+
+cat("\n=== 阶段5: 质量控制 ===\n")
+
+# 计算质控指标
+cat("计算质控指标...\n")
+
+for (i in seq_along(seurat_myo_list)){
+  seurat_myo_list[[i]][["percent.mt"]] <- PercentageFeatureSet(
+    seurat_myo_list[[i]], pattern = "^MT-")
+  seurat_myo_list[[i]][["percent.hemo"]] <- tryCatch({
+    PercentageFeatureSet(seurat_myo_list[[i]], features = c("HBA1", "HBA2", "HBB"))
+  }, error = function(e){ return(0) })
+  seurat_myo_list[[i]][["percent.endometrioid"]] <- tryCatch({
+    PercentageFeatureSet(seurat_myo_list[[i]], features = c("EPCAM", "KRT18"))
+  }, error = function(e){ return(0) })
+}
+
+for (i in seq_along(seurat_fib_list)){
+  seurat_fib_list[[i]][["percent.mt"]] <- PercentageFeatureSet(
+    seurat_fib_list[[i]], pattern = "^MT-")
+  seurat_fib_list[[i]][["percent.hemo"]] <- tryCatch({
+    PercentageFeatureSet(seurat_fib_list[[i]], features = c("HBA1", "HBA2", "HBB"))
+  }, error = function(e){ return(0) })
+  seurat_fib_list[[i]][["percent.endometrioid"]] <- tryCatch({
+    PercentageFeatureSet(seurat_fib_list[[i]], features = c("EPCAM", "KRT18"))
+  }, error = function(e){ return(0) })
+}
+
+# QC 过滤
+cat("应用 QC 过滤...\n")
+seurat_myo_list <- lapply(seurat_myo_list, FUN = function(x){
+  subset(x, subset = nFeature_RNA < 2500 & percent.mt < 7 & 
+           percent.hemo < 1 & percent.endometrioid == 0)
+})
+
+seurat_fib_list <- lapply(seurat_fib_list, FUN = function(x){
+  subset(x, subset = nFeature_RNA < 2500 & percent.mt < 7 & 
+           percent.hemo < 1 & percent.endometrioid == 0)
+})
+
+# 统计过滤后的细胞数
+total_myo_cells <- sum(sapply(seurat_myo_list, ncol))
+total_fib_cells <- sum(sapply(seurat_fib_list, ncol))
+
+cat("✓ QC 完成\n")
+cat("  子宫肌层细胞数:", total_myo_cells, "\n")
+cat("  子宫肌瘤细胞数:", total_fib_cells, "\n")
+```
+
+# 阶段6: 标准化和整合
+
+```{r normalization}
+#| label: normalization
+#| cache: true
+#| dependson: qc
+#| cache.lazy: false
+
+cat("\n=== 阶段6: 标准化和整合 ===\n")
+
+# SCTransform 标准化
+cat("标准化子宫肌层样本...\n")
+seurat_myo_list <- suppressMessages(lapply(seurat_myo_list, SCTransform, verbose = FALSE))
+
+cat("标准化子宫肌瘤样本...\n")
+seurat_fib_list <- suppressMessages(lapply(seurat_fib_list, SCTransform, verbose = FALSE))
+
+# 选择整合特征
+cat("选择整合特征...\n")
+features_myo <- SelectIntegrationFeatures(object.list = seurat_myo_list, nfeatures = 3000)
+features_fib <- SelectIntegrationFeatures(object.list = seurat_fib_list, nfeatures = 3000)
+
+# 整合数据
+cat("整合子宫肌层数据...\n")
+anchors_myo <- suppressMessages(FindIntegrationAnchors(
+  object.list = seurat_myo_list, 
+  anchor.features = features_myo,
+  verbose = FALSE
+))
+
+cat("整合子宫肌瘤数据...\n")
+anchors_fib <- suppressMessages(FindIntegrationAnchors(
+  object.list = seurat_fib_list, 
+  anchor.features = features_fib,
+  verbose = FALSE
+))
+
+seurat_combined_myo <- suppressMessages(IntegrateData(anchorset = anchors_myo, verbose = FALSE))
+seurat_combined_fib <- suppressMessages(IntegrateData(anchorset = anchors_fib, verbose = FALSE))
+
+# PCA 和 UMAP
+cat("运行 PCA 和 UMAP...\n")
+DefaultAssay(seurat_combined_myo) <- "integrated"
+DefaultAssay(seurat_combined_fib) <- "integrated"
+
+seurat_combined_myo <- SCTransform(seurat_combined_myo, verbose = FALSE)
+seurat_combined_fib <- SCTransform(seurat_combined_fib, verbose = FALSE)
+
+seurat_combined_myo <- RunPCA(seurat_combined_myo, npcs = 30, verbose = FALSE)
+seurat_combined_fib <- RunPCA(seurat_combined_fib, npcs = 30, verbose = FALSE)
+
+seurat_combined_myo <- RunUMAP(seurat_combined_myo, reduction = "pca", dims = 1:20, verbose = FALSE)
+seurat_combined_fib <- RunUMAP(seurat_combined_fib, reduction = "pca", dims = 1:20, verbose = FALSE)
+
+seurat_combined_myo <- FindNeighbors(seurat_combined_myo, reduction = "pca", dims = 1:20, verbose = FALSE)
+seurat_combined_fib <- FindNeighbors(seurat_combined_fib, reduction = "pca", dims = 1:20, verbose = FALSE)
+
+seurat_combined_myo <- FindClusters(seurat_combined_myo, resolution = 0.5, verbose = FALSE)
+seurat_combined_fib <- FindClusters(seurat_combined_fib, resolution = 0.5, verbose = FALSE)
+
+cat("✓ 标准化和整合完成\n")
+cat("  子宫肌层聚类数:", length(unique(seurat_combined_myo$seurat_clusters)), "\n")
+cat("  子宫肌瘤聚类数:", length(unique(seurat_combined_fib$seurat_clusters)), "\n")
+```
+
+# 阶段7: 细胞类型鉴定
+
+```{r celltyping}
+#| label: celltyping
+#| cache: true
+#| dependson: normalization
+
+cat("\n=== 阶段7: 细胞类型鉴定 ===\n")
+
+# 鉴定细胞类型标记基因
+cat("寻找标记基因...\n")
+seurat_combined_myo <- PrepSCTFindMarkers(seurat_combined_myo, assay = "SCT")
+seurat_combined_fib <- PrepSCTFindMarkers(seurat_combined_fib, assay = "SCT")
+
+myo_de_genes <- FindAllMarkers(seurat_combined_myo, assay = "SCT", 
+                                only.pos = TRUE, verbose = FALSE)
+fib_de_genes <- FindAllMarkers(seurat_combined_fib, assay = "SCT", 
+                                only.pos = TRUE, verbose = FALSE)
+
+# 根据标记基因定义细胞类型
+# 注意: 这些聚类编号可能需要根据实际数据调整
+seurat_combined_myo[["cell.type"]] <- sapply(
+  seurat_combined_myo$seurat_clusters, 
+  FUN = function(x){
+    cell.type <- ifelse(x %in% c(0), "smc",
+                        ifelse(x %in% c(7), "fibroblast",
+                               ifelse(x %in% c(2, 4, 6, 9, 11, 12, 14, 15, 16), "endothelial",
+                                      ifelse(x %in% c(1, 3, 8, 10, 18), "lymphoid",
+                                             ifelse(x %in% c(5, 13, 17), "myeloid", NA)))))
+    return(cell.type)
+  }
+)
+
+seurat_combined_fib[["cell.type"]] <- sapply(
+  seurat_combined_fib$seurat_clusters, 
+  FUN = function(x){
+    cell.type <- ifelse(x %in% c(0, 1, 2, 4, 5, 13, 14), "smc",
+                        ifelse(x %in% c(17), "fibroblast",
+                               ifelse(x %in% c(7, 9, 10, 11), "endothelial",
+                                      ifelse(x %in% c(3, 6, 8, 15), "lymphoid",
+                                             ifelse(x %in% c(12, 16), "myeloid", NA)))))
+    return(cell.type)
+  }
+)
+
+seurat_combined_myo$cell.type <- factor(
+  seurat_combined_myo$cell.type, 
+  levels = c("smc", "fibroblast", "endothelial", "lymphoid", "myeloid")
+)
+seurat_combined_fib$cell.type <- factor(
+  seurat_combined_fib$cell.type, 
+  levels = c("smc", "fibroblast", "endothelial", "lymphoid", "myeloid")
+)
+
+# 统计各细胞类型数量
+cat("\n子宫肌层细胞类型分布:\n")
+print(table(seurat_combined_myo$cell.type))
+
+cat("\n子宫肌瘤细胞类型分布:\n")
+print(table(seurat_combined_fib$cell.type))
+
+cat("✓ 细胞类型鉴定完成\n")
+
+# 保存 Seurat 对象
+cat("保存 Seurat 对象...\n")
+saveRDS(seurat_combined_myo, file = "results/GSE162122_Myometrium_Combined.RDS")
+saveRDS(seurat_combined_fib, file = "results/GSE162122_Fibroid_Combined.RDS")
+write.csv(myo_de_genes, "results/myo_de_genes_scrnaseq.csv", row.names = FALSE)
+write.csv(fib_de_genes, "results/fib_de_genes_scrnaseq.csv", row.names = FALSE)
+```
+
+# 阶段8: 生成图3a - UMAP聚类图
+
+```{r figure3a}
+#| label: figure3a
+#| cache: true
+#| dependson: celltyping
+#| fig-width: 12
+#| fig-height: 5
+
+cat("\n=== 阶段8: 生成图3a (UMAP聚类图) ===\n")
+
+# 定义颜色
+cell_type_colors <- c(
+  "smc" = "#1f77b4", 
+  "fibroblast" = "#ff7f0e",
+  "endothelial" = "#2ca02c",
+  "lymphoid" = "#d62728",
+  "myeloid" = "#9467bd"
+)
+
+# 子宫肌瘤 UMAP
+fig3a_fib <- DimPlot(
+  seurat_combined_fib, 
+  group.by = "cell.type", 
+  label = TRUE, 
+  repel = TRUE,
+  pt.size = 0.5,
+  cols = cell_type_colors
+) +
+  ggtitle("Uterine Fibroid") +
+  theme_minimal() +
+  NoLegend()
+
+# 子宫肌层 UMAP
+fig3a_myo <- DimPlot(
+  seurat_combined_myo, 
+  group.by = "cell.type", 
+  label = TRUE, 
+  repel = TRUE,
+  pt.size = 0.5,
+  cols = cell_type_colors
+) +
+  ggtitle("Myometrium") +
+  theme_minimal()
+
+# 合并
+fig3a <- fig3a_fib + fig3a_myo
+
+# 显示
+print(fig3a)
+
+# 保存
+ggsave("figures/Figure3a_UMAP.pdf", fig3a, width = 12, height = 5)
+ggsave("figures/Figure3a_UMAP.png", fig3a, width = 12, height = 5, dpi = 300)
+
+cat("✓ 图3a 已保存到 figures/ 目录\n")
+```
+
+# 阶段9: 生成图3c - 热图
+
+```{r figure3c}
+#| label: figure3c
+#| cache: true
+#| dependson: celltyping
+#| fig-width: 8
+#| fig-height: 6
+
+cat("\n=== 阶段9: 生成图3c (热图) ===\n")
+
+# 提取 VMP1 和 MICU1 在子宫肌瘤中的表达
+genes_of_interest <- c("VMP1", "MICU1")
+
+# 检查基因是否存在
+available_genes <- rownames(seurat_combined_fib)
+if (!all(genes_of_interest %in% available_genes)) {
+  missing_genes <- genes_of_interest[!genes_of_interest %in% available_genes]
+  cat("警告：以下基因未找到:", paste(missing_genes, collapse = ", "), "\n")
+  genes_of_interest <- genes_of_interest[genes_of_interest %in% available_genes]
+}
+
+if (length(genes_of_interest) == 0) {
+  cat("错误: 没有找到任何目标基因\n")
+} else {
+  cat("分析基因:", paste(genes_of_interest, collapse = ", "), "\n")
+  
+  # 获取伪批量数据
+  fib_data <- FetchData(seurat_combined_fib, vars = c("cell.type", genes_of_interest))
+  
+  # 创建伪批量矩阵
+  fib_pseudo <- data.frame()
+  cell_types <- levels(factor(fib_data$cell.type))
+  
+  for (cell_type in cell_types) {
+    data <- fib_data[fib_data$cell.type == cell_type, genes_of_interest, drop = FALSE]
+    mean_expr <- colMeans(data)
+    fib_pseudo <- rbind(fib_pseudo, mean_expr)
+  }
+  
+  row.names(fib_pseudo) <- cell_types
+  fib_pseudo <- as.matrix(fib_pseudo)
+  fib_pseudo <- t(fib_pseudo)  # 转置，使基因为行，细胞类型为列
+  
+  # 重新排序细胞类型
+  cell_type_order <- c("smc", "fibroblast", "endothelial", "lymphoid", "myeloid")
+  fib_pseudo <- fib_pseudo[, cell_type_order, drop = FALSE]
+  
+  # 创建行注释（显示上调/下调）
+  row_annotation <- data.frame(
+    Regulation = sapply(rownames(fib_pseudo), function(gene) {
+      if (gene %in% names(results_list)) {
+        return(results_list[[gene]]$regulation)
+      } else {
+        return("unknown")
+      }
+    })
+  )
+  rownames(row_annotation) <- rownames(fib_pseudo)
+  
+  # 定义颜色
+  ann_colors <- list(
+    Regulation = c(
+      up = "red", 
+      down = "blue", 
+      not_significant = "grey", 
+      unknown = "white",
+      NA = "white"
+    )
+  )
+  
+  # 绘制热图
+  fig3c <- pheatmap(
+    fib_pseudo, 
+    scale = "row", 
+    cluster_rows = FALSE, 
+    cluster_cols = FALSE,
+    color = colorRampPalette(c("blue", "white", "red"))(100),
+    border_color = "grey",
+    fontsize = 12,
+    fontsize_row = 12,
+    fontsize_col = 12,
+    main = "Cell type-specific expression of VMP1 and MICU1",
+    annotation_row = row_annotation,
+    annotation_colors = ann_colors,
+    angle_col = 45
+  )
+  
+  # 保存
+  pdf("figures/Figure3c_Heatmap.pdf", width = 8, height = 6)
+  print(fig3c)
+  dev.off()
+  
+  png("figures/Figure3c_Heatmap.png", width = 800, height = 600, res = 100)
+  print(fig3c)
+  dev.off()
+  
+  # 保存伪批量数据
+  write.csv(fib_pseudo, "results/pseudobulk_VMP1_MICU1.csv")
+  
+  cat("✓ 图3c 已保存到 figures/ 目录\n")
+}
+```
+
+# 阶段10: 生成图3d - FeaturePlot
+
+```{r figure3d}
+#| label: figure3d
+#| cache: true
+#| dependson: celltyping
+#| fig-width: 10
+#| fig-height: 5
+
+cat("\n=== 阶段10: 生成图3d (FeaturePlot) ===\n")
+
+# 检查基因是否存在
+if (length(genes_of_interest) > 0) {
+  # FeaturePlot
+  fig3d <- FeaturePlot(
+    seurat_combined_fib, 
+    features = genes_of_interest,
+    pt.size = 0.5,
+    order = TRUE,
+    cols = c("lightgrey", "darkred"),
+    min.cutoff = 0,
+    max.cutoff = "q95"
+  ) &
+    theme_minimal() &
+    theme(plot.title = element_text(size = 14, face = "bold"))
+  
+  # 显示
+  print(fig3d)
+  
+  # 保存
+  ggsave("figures/Figure3d_FeaturePlot.pdf", fig3d, width = 10, height = 5)
+  ggsave("figures/Figure3d_FeaturePlot.png", fig3d, width = 10, height = 5, dpi = 300)
+  
+  cat("✓ 图3d 已保存到 figures/ 目录\n")
+} else {
+  cat("⚠ 跳过图3d: 没有找到目标基因\n")
+}
+```
+
+# 结果汇总
+
+```{r summary}
+#| label: summary
+
+cat("\n=== 分析完成汇总 ===\n\n")
+
+cat("1. RNA-seq 分析结果:\n")
+if (exists("results_summary")) {
+  print(results_summary)
+} else {
+  cat("   请查看 results/VMP1_MICU1_regulation_summary.csv\n")
+}
+
+cat("\n2. 生成的文件:\n")
+cat("   - figures/Figure3a_UMAP.pdf/png\n")
+cat("   - figures/Figure3c_Heatmap.pdf/png\n")
+cat("   - figures/Figure3d_FeaturePlot.pdf/png\n")
+
+cat("\n3. 结果文件:\n")
+cat("   - results/GSE169255_DEG_results.csv\n")
+cat("   - results/VMP1_MICU1_regulation_summary.csv\n")
+cat("   - results/GSE162122_Myometrium_Combined.RDS\n")
+cat("   - results/GSE162122_Fibroid_Combined.RDS\n")
+cat("   - results/pseudobulk_VMP1_MICU1.csv\n")
+
+cat("\n✓ 所有分析完成!\n")
+```
+
+# 会话信息
+
+```{r session-info}
+#| label: session-info
+
+sessionInfo()
+```
